@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Renew an inference token and call Cursor's private inference stream.
 
-Default model: grok-4.5 with effort=high and fast=true.
+Default model: grok-4.7. The lane resolves the family slug to grok-4.7-high-fast
 The conversation ID is generated once and retained in the token cache.
 
 Usage:
@@ -22,6 +22,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 
 DEFAULT_BACKEND_URL = "https://api2.cursor.sh"
@@ -34,9 +35,32 @@ DEFAULT_CLIENT_VERSION = "0.30.0"
 DEFAULT_NAMESPACE = "prod"
 
 # src/shared/agents/agent-model.ts
-DEFAULT_MODEL_ID = "grok-4.5"
+DEFAULT_MODEL_ID = "grok-4.7"
 DEFAULT_MAX_MODE = False
 DEFAULT_MODEL_PARAMS = (("effort", "high"), ("fast", "true"))
+
+SECRETS_ENV_FILE = Path(
+    os.environ.get("GROKBOT_SECRETS_FILE") or (Path.home() / ".omp/agent/secrets/grokbot.env")
+)
+
+
+def read_secrets_file() -> dict[str, str]:
+    """omp's grokbot secrets file (SAND_INFERENCE_RENEWAL_CREDENTIAL + GROKBOT_MACHINE_ID).
+
+    Keeps one source of truth: process env wins, this file is the fallback so the bridge can be
+    started by a supervisor unit without duplicating secrets into unit config.
+    """
+    out: dict[str, str] = {}
+    try:
+        for line in SECRETS_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            out[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return out
 
 REFRESH_LEEWAY_MS = 2 * 60 * 1000
 DEFAULT_TTL_MS = 10 * 60 * 1000
@@ -188,6 +212,39 @@ def iter_envelopes_from_bytes(raw: bytes) -> list[tuple[int, bytes]]:
     return chunks
 
 
+def read_exactly(fp, count: int) -> bytes:
+    """Read exactly ``count`` bytes from ``fp``, or fewer at end of stream."""
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = fp.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def iter_envelopes_from_fp(fp) -> Iterator[tuple[int, bytes]]:
+    """Yield (flags, payload) as each Connect envelope arrives on ``fp``.
+
+    Same framing as :func:`iter_envelopes_from_bytes` — one flag byte, a 4-byte
+    big-endian length, then the payload — but this one never waits for end of
+    stream, so the bridge can forward a delta the moment upstream emits it. A
+    truncated trailing envelope is dropped, exactly as the buffered reader drops
+    it.
+    """
+    while True:
+        header = read_exactly(fp, 5)
+        if len(header) < 5:
+            return
+        length = int.from_bytes(header[1:5], "big")
+        payload = read_exactly(fp, length)
+        if len(payload) < length:
+            return
+        yield header[0], payload
+
+
 def enhanced_obfuscate(data: bytearray) -> bytes:
     last = 165
     for i in range(len(data)):
@@ -215,7 +272,9 @@ def cursor_checksum(machine_id: str) -> str:
 
 
 def load_machine_id() -> str:
-    override = (os.environ.get("SAND_MACHINE_ID") or "").strip()
+    override = (os.environ.get("SAND_MACHINE_ID") or os.environ.get("GROKBOT_MACHINE_ID") or "").strip()
+    if not override:
+        override = (read_secrets_file().get("GROKBOT_MACHINE_ID") or "").strip()
     if override:
         return override
 
@@ -315,10 +374,13 @@ def write_cache(path: Path, access_token: str, expires_at_ms: int, conversation_
 
 
 def load_renewal_credential(args) -> str:
-    env = (os.environ.get(CREDENTIAL_ENV) or "").strip()
+    env = (os.environ.get(CREDENTIAL_ENV) or os.environ.get("GROKBOT_RENEWAL_CREDENTIAL") or "").strip()
+    if not env:
+        secrets = read_secrets_file()
+        env = (secrets.get(CREDENTIAL_ENV) or secrets.get("GROKBOT_RENEWAL_CREDENTIAL") or "").strip()
     if env:
         return env
-    raise SystemExit(f"set {CREDENTIAL_ENV} before starting the client")
+    raise SystemExit(f"set {CREDENTIAL_ENV} (or write {SECRETS_ENV_FILE}) before starting the client")
 
 
 def default_conversation_id() -> str:
@@ -349,13 +411,91 @@ def renew(credential: str, backend_url: str, meta: dict[str, str]) -> dict:
             parsed = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raise SystemExit(f"renewal failed HTTP {e.code}: {e.read().decode('utf-8','replace')[:500]}") from e
-    token = parsed.get("accessToken") if isinstance(parsed, dict) else None
+    # The sand exchange returns TWO tokens: accessToken (type: session) and grokBotToken
+    # (type: grok_bot). Only grokBotToken authenticates aiserver.v1.InferenceService/Stream —
+    # measured on 2026-09-15: accessToken yields ERROR_NOT_LOGGED_IN, grokBotToken streams.
+    # STRICT: no fallback to the session token. A silent fallback would turn a missing/renamed
+    # field into "every request fails with ERROR_NOT_LOGGED_IN"; fail loudly and name the field.
+    token = None
+    if isinstance(parsed, dict):
+        for field in ("grokBotToken", "grok_bot_token"):
+            candidate = parsed.get(field)
+            if isinstance(candidate, str) and candidate:
+                token = candidate
+                break
     if not isinstance(token, str) or not token:
-        raise SystemExit("renewal returned no accessToken")
+        keys = sorted(parsed.keys()) if isinstance(parsed, dict) else []
+        raise SystemExit(
+            "renewal returned no grokBotToken (response keys: "
+            f"{keys}); refusing to fall back to the session token"
+        )
     exp = parsed.get("expiresAtMs")
     if not isinstance(exp, (int, float)):
         exp = jwt_exp_ms(token) or (now_ms() + DEFAULT_TTL_MS)
-    return {"accessToken": token, "expiresAtMs": int(exp), "renewed": True}
+    return {"accessToken": token, "expiresAtMs": int(exp), "renewed": True, "sessionToken": (parsed.get("accessToken") if isinstance(parsed, dict) else None)}
+
+
+# Sand usage/allowance status. Lives on the Dashboard service, is an empty request message, and —
+# unlike inference — authenticates with the SESSION token (accessToken), not grokBotToken:
+#   measured 2026-09-15: accessToken -> 200, grokBotToken -> 401 ERROR_NOT_LOGGED_IN.
+SAND_USAGE_PATH = "/aiserver.v1.DashboardService/GetSandUsageStatus"
+
+
+def fetch_sand_usage(
+    credential: str,
+    backend_url: str,
+    meta: dict[str, str],
+    machine_id: str,
+    timeout_ms: int = 30000,
+) -> dict:
+    """Mint a session token and read the sand weekly allowance status.
+
+    Returns the upstream fields (usagePercent is USED, not remaining) plus
+    usageRemainingPercent, or {"error": ...} — never raises for callers that want a soft surface.
+    """
+    try:
+        minted = renew(credential, backend_url, meta)
+    except SystemExit as e:
+        return {"error": str(e)}
+    session = minted.get("sessionToken")
+    if not isinstance(session, str) or not session:
+        return {"error": "renewal returned no session token for usage lookup"}
+    url = backend_url.rstrip("/") + SAND_USAGE_PATH
+    headers = {
+        "authorization": f"Bearer {session}",
+        "content-type": "application/json",
+        "connect-protocol-version": "1",
+        "connect-timeout-ms": str(timeout_ms),
+        "x-cursor-checksum": cursor_checksum(machine_id),
+        **meta,
+    }
+    req = urllib.request.Request(url, data=b"{}", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_ms / 1000) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return {"error": f"usage lookup HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:300]}"}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"usage lookup {type(e).__name__}: {e}"}
+    if not isinstance(data, dict):
+        return {"error": "usage lookup returned a non-object payload"}
+    used = data.get("usagePercent")
+    out = {
+        "usagePercent": used,
+        "usageRemainingPercent": round(100 - float(used), 3) if isinstance(used, (int, float)) else None,
+        "currentPeriodStart": data.get("currentPeriodStart"),
+        "nextResetTimestampUtc": data.get("nextResetTimestampUtc"),
+        "hasAvailableUsage": data.get("hasAvailableUsage"),
+        "hasNonZeroIncludedLimit": data.get("hasNonZeroIncludedLimit"),
+        "availableBankedResetCount": data.get("availableBankedResetCount"),
+        "usesPooledEnterpriseAllowance": data.get("usesPooledEnterpriseAllowance"),
+        "grokPlanLabel": data.get("grokPlanLabel"),
+        "cursorPlanName": data.get("cursorPlanName"),
+    }
+    ondemand = data.get("onDemandSettings")
+    if isinstance(ondemand, dict):
+        out["onDemandDashboardUrl"] = ondemand.get("dashboardUrl")
+    return out
 
 
 def get_access_token(args, credential: str, meta: dict[str, str], force: bool = False) -> dict:
@@ -451,6 +591,7 @@ def stream_llm(args, access_token: str, prompt: str) -> dict:
             model = part["model"]
         if part["error"]:
             errors.append(part["error"])
+
 
     err = None
     if trailer and isinstance(trailer, dict) and trailer.get("error"):
